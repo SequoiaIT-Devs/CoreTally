@@ -1,0 +1,12 @@
+# CoreTally configuration (Slurm 25.05)
+rates:
+  cpu_rate: 0.05
+  gpu_rate: 0.50
+  mem_rate: 0.01
+
+# sacct filters and scope; adjust to your cluster
+sacct_extra_args:
+  - --clusters=merced
+  - --accounts=pi_%
+  - --partition=cpu,gpu
+  - --state=COMPLETED,FAILED,TIMEOUT
