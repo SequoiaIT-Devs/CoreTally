@@ -1,4 +1,5 @@
-# CoreTally — HPC Recharge Summary (Slurm 25.05)
+# CoreTally — HPC Recharge Summary 
+Slurm Supported: 25.05
 
 **Billing method**
 - CPU-hours = `CPUTimeRAW / 3600`
