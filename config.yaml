@@ -10,3 +10,14 @@ sacct_extra_args:
   - --accounts=pi_%
   - --partition=cpu,gpu
   - --state=COMPLETED,FAILED,TIMEOUT
+
+# SMTP settings for mail-out
+smtp:
+  host: smtp.example.edu
+  port: 587
+  username: coretally@example.edu
+  password: changeme
+  use_tls: true
+  from_addr: coretally@example.edu
+  finance_to:
+    - finance@example.edu

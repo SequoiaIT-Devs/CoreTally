@@ -1,40 +1,21 @@
 #!/usr/bin/env python3
 """
 CoreTally — HPC Recharge Summary MVP (Slurm 25.05 optimized)
-- Actual-usage billing with fallbacks:
+Now with **mail-out** support:
+  - Sends Finance a monthly CSV
+  - Sends each PI their PDF summary
+
+Billing (selected):
   * CPU-hours = CPUTimeRAW / 3600
   * GPU-hours = TRESUsageInAve['gres/gpu'] / 3600  (fallback: AllocTRES * ElapsedHours)
   * Mem GB-hours = AveRSS(GB) * ElapsedHours       (fallback: ReqMem(GB) * ElapsedHours)
-- Stores monthly PI/account totals in SQLite
-- FastAPI endpoints for JSON/CSV and PDF export
 
-Expected Slurm configuration (25.05):
-  slurm.conf
-    AccountingStorageType=accounting_storage/slurmdbd
-    AccountingStorageHost=<slurmdbd-host>
-    SelectType=select/cons_tres
-    SelectTypeParameters=CR_Core_Memory
-    JobAcctGatherType=jobacct_gather/cgroup
-    JobAcctGatherFrequency=30
-  cgroup.conf
-    CgroupAutomount=yes
-    ConstrainCores=yes
-    ConstrainRAMSpace=yes
-    ConstrainDevices=yes
-  gres.conf
-    Name=gpu Type=<model> File=/dev/nvidia0 ... (and NodeName has Gres=gpu:<count>)
-
-Usage:
-  1) CLI:
-     python coretally.py generate --month 2025-07
-     python coretally.py csv --month 2025-07 --out july.csv
-     python coretally.py pdf --month 2025-07 --out july.pdf
-  2) API:
-     uvicorn coretally:app --host 0.0.0.0 --port 8000
+Expected Slurm configuration: see README.md
 """
-import argparse, csv, datetime as dt, os, re, sqlite3, subprocess, sys
+import argparse, csv, datetime as dt, os, re, sqlite3, subprocess, sys, tempfile, smtplib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from email.message import EmailMessage
 
 # Optional deps (API/PDF)
 try:
@@ -85,12 +66,13 @@ class UsageRow:
     state: str
 
 def load_config(path: str = CONFIG_PATH) -> dict:
-    cfg = {"rates": DEFAULT_RATES, "sacct_extra_args": []}
+    cfg = {"rates": DEFAULT_RATES, "sacct_extra_args": [], "smtp": {}}
     if yaml and os.path.exists(path):
         with open(path, "r") as f:
             data = yaml.safe_load(f) or {}
             cfg["rates"] = data.get("rates", DEFAULT_RATES)
             cfg["sacct_extra_args"] = data.get("sacct_extra_args", [])
+            cfg["smtp"] = data.get("smtp", {})
     return cfg
 
 def ensure_db():
@@ -291,9 +273,108 @@ def generate_pdf(summaries: List[dict], out_path: str):
         c.showPage()
     c.save()
 
+# ------------------ Email Utilities ------------------
+def _smtp_client(smtp_cfg: dict):
+    host = smtp_cfg.get("host"); port = int(smtp_cfg.get("port", 587))
+    user = smtp_cfg.get("username"); pwd = smtp_cfg.get("password")
+    use_tls = bool(smtp_cfg.get("use_tls", True))
+    if not host:
+        raise RuntimeError("SMTP host not configured")
+    client = smtplib.SMTP(host, port, timeout=30)
+    if use_tls:
+        client.starttls()
+    if user and pwd:
+        client.login(user, pwd)
+    return client
+
+def _send_email(smtp_cfg: dict, subject: str, body: str, to_addrs: List[str], attachments: List[Tuple[str, bytes, str]]):
+    msg = EmailMessage()
+    from_addr = smtp_cfg.get("from_addr") or smtp_cfg.get("username")
+    if not from_addr:
+        raise RuntimeError("SMTP from_addr or username required")
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = subject
+    msg.set_content(body)
+    for filename, data, mime in attachments or []:
+        maintype, subtype = mime.split("/", 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
+    with _smtp_client(smtp_cfg) as cli:
+        cli.send_message(msg)
+
+def mailout(month: str, cfg: dict):
+    """Generate finance CSV and per-PI PDFs and send emails based on config.smtp settings."""
+    ensure_db()
+    # pull summaries from DB; if empty, generate them first
+    con = sqlite3.connect(DB_PATH); cur = con.cursor()
+    cur.execute("""SELECT pi_name, pi_email, account, month, job_count, cpu_hours, gpu_hours, mem_gb_hours, total_cost
+                   FROM usage_monthly WHERE month = ? ORDER BY total_cost DESC""", (month,))
+    rows = cur.fetchall(); con.close()
+    cols = ["pi_name","pi_email","account","month","job_count","cpu_hours","gpu_hours","mem_gb_hours","total_cost"]
+    summaries = [dict(zip(cols, r)) for r in rows]
+    if not summaries:
+        # generate on the fly
+        summaries = aggregate_month(month, cfg, demo_csv=None)
+        save_to_db(summaries)
+
+    # Finance CSV
+    csv_text = generate_csv(summaries)
+    finance_to = cfg.get("smtp", {}).get("finance_to", [])
+    if isinstance(finance_to, str):
+        finance_to = [finance_to]
+    finance_subject = f"[CoreTally] Recharge CSV for {month}"
+    finance_body = f"Attached is the recharge CSV for {month}.\n\nRows: {len(summaries)}"
+    attachments = [ (f"coretally_{month}.csv", csv_text.encode("utf-8"), "text/csv") ]
+
+    # PI PDFs
+    smtp_cfg = cfg.get("smtp", {})
+    # send finance first (if configured)
+    if finance_to:
+        _send_email(smtp_cfg, finance_subject, finance_body, finance_to, attachments)
+
+    # Send each PI their own PDF
+    # Build one-page PDF per PI
+    if canvas:
+        for s in summaries:
+            try:
+                import io
+                buf = io.BytesIO()
+                # reuse PDF function but for a single summary
+                generate_pdf([s], out_path=buf)  # our generate_pdf expects path; adapt:
+            except TypeError:
+                # generate_pdf wrote expecting a path; re-implement quick one-page for buffer
+                from reportlab.lib.pagesizes import LETTER
+                from reportlab.pdfgen import canvas as cv
+                from reportlab.lib.units import inch
+                c = cv.Canvas(buf, pagesize=LETTER)
+                width, height = LETTER; margin = 0.75*inch
+                footer = ("CoreTally — Memory billed by AveRSS × elapsed (fallback ReqMem). "
+                          "GPU billed by TRESUsageInAve['gres/gpu'] (fallback AllocTRES × elapsed). "
+                          "CPU billed by CPUTimeRAW/3600. States: COMPLETED/FAILED/TIMEOUT.")
+                y = height - margin
+                c.setFont("Helvetica-Bold", 14); c.drawString(margin, y, f"CoreTally Monthly Recharge Summary - {s['month']}"); y -= 20
+                c.setFont("Helvetica", 11)
+                c.drawString(margin, y, f"PI: {s['pi_name']}  |  Account: {s['account']}  |  Email: {s['pi_email']}"); y -= 16
+                c.drawString(margin, y, f"Jobs: {s['job_count']}"); y -= 14
+                c.drawString(margin, y, f"CPU Hours: {s['cpu_hours']:.2f}"); y -= 14
+                c.drawString(margin, y, f"GPU Hours: {s['gpu_hours']:.2f}"); y -= 14
+                c.drawString(margin, y, f"Memory GB-Hours: {s['mem_gb_hours']:.2f}"); y -= 20
+                c.setFont("Helvetica-Bold", 12); c.drawString(margin, y, f"Total Cost (USD): ${s['total_cost']:.2f}")
+                c.setFont("Helvetica", 8); c.drawString(margin, 0.5*inch, footer)
+                c.showPage(); c.save()
+            except Exception:
+                continue
+            pdf_bytes = buf.getvalue()
+            buf.close()
+            to_addr = [s["pi_email"]]
+            subject = f"[CoreTally] Monthly Recharge Summary — {s['month']}"
+            body = f"Hello {s['pi_name']},\n\nAttached is your CoreTally recharge summary for {s['month']}.\n\nRegards,\nCoreTally"
+            attach_name = f"coretally_{s['account']}_{s['month']}.pdf"
+            _send_email(smtp_cfg, subject, body, to_addr, [(attach_name, pdf_bytes, "application/pdf")])
+
 # ------------- FastAPI -------------
 if FastAPI:
-    app = FastAPI(title="CoreTally API", version="0.2.0")
+    app = FastAPI(title="CoreTally API", version="0.3.0")
     @app.get("/summary/{month}")
     def get_month(month: str, format: str="json"):
         ensure_db()
@@ -316,9 +397,14 @@ if FastAPI:
         save_to_db(summaries)
         return {"inserted": len(summaries), "month": month}
 
+    @app.post("/mailout/{month}")
+    def post_mailout(month: str):
+        cfg = load_config(); mailout(month, cfg)
+        return {"status": "sent", "month": month}
+
 # ------------- CLI -------------
 def main():
-    parser = argparse.ArgumentParser(description="CoreTally — HPC Recharge Summary (25.05)")
+    parser = argparse.ArgumentParser(description="CoreTally — HPC Recharge Summary (25.05) with mail-out")
     sub = parser.add_subparsers(dest="cmd")
 
     g = sub.add_parser("generate", help="Generate summaries for a month")
@@ -332,6 +418,10 @@ def main():
     p = sub.add_parser("pdf", help="Export PDF for a month from DB")
     p.add_argument("--month", required=True, help="YYYY-MM")
     p.add_argument("--out", default="recharge_summary.pdf")
+
+    m = sub.add_parser("mailout", help="Email Finance CSV and per-PI PDFs")
+    m.add_argument("--month", required=True, help="YYYY-MM")
+    m.add_argument("--dry-run", action="store_true", help="Do not send, just print recipients")
 
     args = parser.parse_args()
     if args.cmd=="generate":
@@ -356,6 +446,19 @@ def main():
         if not rows: print("No data"); sys.exit(1)
         cols=["pi_name","pi_email","account","month","job_count","cpu_hours","gpu_hours","mem_gb_hours","total_cost"]
         generate_pdf([dict(zip(cols,r)) for r in rows], args.out); print(f"Wrote {args.out}")
+    elif args.cmd=="mailout":
+        cfg = load_config()
+        if args.dry_run:
+            # Show who would get emails based on DB
+            ensure_db(); con = sqlite3.connect(DB_PATH); cur = con.cursor()
+            cur.execute("""SELECT DISTINCT pi_email FROM usage_monthly WHERE month=?""", (args.month,))
+            pi_emails = [r[0] for r in cur.fetchall()]
+            finance_to = cfg.get("smtp", {}).get("finance_to", [])
+            if isinstance(finance_to, str): finance_to = [finance_to]
+            print("Finance:", finance_to)
+            print("PIs:", pi_emails)
+        else:
+            mailout(args.month, cfg); print(f"Mail-out sent for {args.month}")
     else:
         parser.print_help()
 

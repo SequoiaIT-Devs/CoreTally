@@ -34,3 +34,30 @@ python coretally.py csv --month 2025-07 --out july.csv
 python coretally.py pdf --month 2025-07 --out july.pdf
 uvicorn coretally:app --host 0.0.0.0 --port 8000
 ```
+
+## Mail-out (Finance CSV + per-PI PDFs)
+1. Configure SMTP in `config.yaml`:
+```yaml
+smtp:
+  host: smtp.example.edu
+  port: 587
+  username: coretally@example.edu
+  password: changeme
+  use_tls: true
+  from_addr: coretally@example.edu
+  finance_to:
+    - finance@example.edu
+```
+2. Send for a month:
+```bash
+python coretally.py mailout --month 2025-07
+```
+3. Dry-run to preview recipients:
+```bash
+python coretally.py mailout --month 2025-07 --dry-run
+```
+
+### Cron example (run on the 2nd of each month at 07:15)
+```
+15 7 2 * * /usr/bin/python3 /opt/coretally/coretally.py mailout --month $(date -d "last month" +\%Y-\%m) >> /var/log/coretally_mailout.log 2>&1
+```
