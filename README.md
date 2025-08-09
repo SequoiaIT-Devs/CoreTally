@@ -1,4 +1,4 @@
-# CoreTally HPC Recharge Summary
+# CoreTally
 Supported Scheduler: Slurm 25.05
 
 
