@@ -1,4 +1,4 @@
-# CoreTally configuration (Slurm 25.05)
+# CoreTally configuration
 rates:
   cpu_rate: 0.05
   gpu_rate: 0.50
@@ -11,13 +11,19 @@ sacct_extra_args:
   - --partition=cpu,gpu
   - --state=COMPLETED,FAILED,TIMEOUT
 
-# SMTP settings for mail-out
+# Optional SMTP for mailout()
 smtp:
   host: smtp.example.edu
   port: 587
-  username: coretally@example.edu
-  password: changeme
-  use_tls: true
-  from_addr: coretally@example.edu
-  finance_to:
-    - finance@example.edu
+  starttls: true
+  username: noreply@example.edu
+  password: ""
+  from_addr: noreply@example.edu
+  finance_to: ["finance@example.edu"]
+
+# Optional OIDC (CILogon) for API
+oidc:
+  client_id: ""
+  client_secret: ""
+  redirect_uri: "https://your-host.example.edu/callback"
+  allowed_domains: ["example.edu"]
