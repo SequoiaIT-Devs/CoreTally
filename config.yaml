@@ -6,7 +6,7 @@ rates:
 
 # sacct filters and scope; adjust to your cluster
 sacct_extra_args:
-  - --clusters=merced
+  - --clusters={clustername}
   - --accounts=pi_%
   - --partition=cpu,gpu
   - --state=COMPLETED,FAILED,TIMEOUT
